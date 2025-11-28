@@ -3,19 +3,18 @@ import numpy as np
 from sklearn.model_selection import train_test_split
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.preprocessing import LabelEncoder
-# 引入高级激活函数和正则化
+from sklearn.utils import class_weight
 from tensorflow.keras.models import Sequential
 from tensorflow.keras.layers import Dense, Dropout, BatchNormalization, Input, LeakyReLU
 from tensorflow.keras.regularizers import l2
 from tensorflow.keras.utils import to_categorical
 from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau
 from tensorflow.keras.optimizers import Adam
+from tensorflow.keras.losses import CategoricalCrossentropy
 
 # 1. 读取数据
 train_df = pd.read_csv('train.csv')
 test_df = pd.read_csv('test.csv')
-
-# --- 关键回退：不进行任何文本清洗，保留原始信息 ---
 
 # 2. 数据准备
 X = train_df['text']
@@ -25,11 +24,20 @@ y = train_df['emotions']
 label_encoder = LabelEncoder()
 y_encoded = label_encoder.fit_transform(y)
 
+# --- 新增技巧 1: 计算类别权重 (解决样本不平衡) ---
+# 这会让模型更“重视”那些样本量少的稀有情感，防止被样本量大的情感淹没
+class_weights = class_weight.compute_class_weight(
+    class_weight='balanced',
+    classes=np.unique(y_encoded),
+    y=y_encoded
+)
+class_weight_dict = dict(enumerate(class_weights))
+print("类别权重已计算:", class_weight_dict)
+
 # 划分训练集
 X_train, X_val, y_train, y_val = train_test_split(X, y_encoded, test_size=0.2, random_state=42)
 
-# 特征提取 
-# 保持 12000 特征 (这是之前的最佳设置)
+# 特征提取 (保持之前的最佳配置)
 print("正在提取 TF-IDF 特征...")
 tfidf = TfidfVectorizer(stop_words='english', 
                         max_features=12000, 
@@ -39,35 +47,31 @@ X_train_tfidf = tfidf.fit_transform(X_train).toarray()
 X_val_tfidf = tfidf.transform(X_val).toarray()
 X_test_tfidf = tfidf.transform(test_df['text']).toarray()
 
-# 准备标签
 num_classes = len(label_encoder.classes_)
 y_train_onehot = to_categorical(y_train, num_classes)
 y_val_onehot = to_categorical(y_val, num_classes)
 
 # ==========================================
-# 3. 构建高精度深度学习模型 (L2 + LeakyReLU 版)
+# 3. 构建模型 (加入 Label Smoothing)
 # ==========================================
-print("\n--- 构建增强版模型 ---")
+print("\n--- 构建模型 (Label Smoothing + Class Weights) ---")
 
-# 定义 L2 正则化强度 (防止过拟合的另一种强力手段)
 reg_strength = 0.0001
 
 model = Sequential([
     Input(shape=(X_train_tfidf.shape[1],)),
     
-    # 第一层：加入 L2 正则化
+    # 保持之前成功的 L2 + LeakyReLU 结构
     Dense(1024, kernel_regularizer=l2(reg_strength)),
-    LeakyReLU(alpha=0.05),  # 使用 LeakyReLU 替代 ReLU，避免神经元“死亡”
+    LeakyReLU(alpha=0.05),
     BatchNormalization(),
     Dropout(0.5),
     
-    # 第二层
     Dense(512, kernel_regularizer=l2(reg_strength)),
     LeakyReLU(alpha=0.05),
     BatchNormalization(),
     Dropout(0.5),
     
-    # 第三层
     Dense(256, kernel_regularizer=l2(reg_strength)),
     LeakyReLU(alpha=0.05),
     BatchNormalization(),
@@ -77,24 +81,29 @@ model = Sequential([
     Dense(num_classes, activation='softmax')
 ])
 
-# 稍微降低初始学习率，让它学得更稳
+# 优化器
 optimizer = Adam(learning_rate=0.0005)
 
-model.compile(optimizer=optimizer, loss='categorical_crossentropy', metrics=['accuracy'])
+# --- 新增技巧 2: 标签平滑 (Label Smoothing) ---
+# label_smoothing=0.1 表示我们告诉模型：不要太绝对，正确答案可能是 0.9，其他答案分摊 0.1
+# 这能极大提高模型的泛化能力，是打比赛的提分利器。
+loss_fn = CategoricalCrossentropy(label_smoothing=0.1)
+
+model.compile(optimizer=optimizer, loss=loss_fn, metrics=['accuracy'])
 
 # ==========================================
 # 4. 训练模型
 # ==========================================
-# 耐心设大一点，让它充分收敛
 early_stopping = EarlyStopping(monitor='val_loss', patience=6, restore_best_weights=True)
 reduce_lr = ReduceLROnPlateau(monitor='val_loss', factor=0.2, patience=2, min_lr=1e-6, verbose=1)
 
 print("开始训练...")
 history = model.fit(X_train_tfidf, y_train_onehot, 
                     validation_data=(X_val_tfidf, y_val_onehot),
-                    epochs=35,           # 增加轮数
+                    epochs=35,
                     batch_size=128, 
-                    callbacks=[early_stopping, reduce_lr])
+                    callbacks=[early_stopping, reduce_lr],
+                    class_weight=class_weight_dict) # 在这里应用类别权重
 
 # 5. 评估与预测
 print("正在评估模型...")
@@ -111,5 +120,5 @@ submission = pd.DataFrame({
     'label': test_labels_decoded
 })
 
-submission.to_csv('submission_l2.csv', index=False)
-print("完成！结果已保存为 'submission_l2.csv'")
+submission.to_csv('submission_ls.csv', index=False)
+print("完成！结果已保存为 'submission_ls.csv'")
