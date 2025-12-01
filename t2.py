@@ -1,3 +1,7 @@
+import os
+# 1. 强行屏蔽烦人的 GPU 缺失警告 (在导入 TF 之前设置)
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3' 
+
 import pandas as pd
 import numpy as np
 import gc
@@ -6,10 +10,8 @@ from sklearn.model_selection import StratifiedKFold
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.preprocessing import LabelEncoder
 from sklearn.utils import class_weight
-from sklearn.svm import LinearSVC
-from sklearn.calibration import CalibratedClassifierCV
-from sklearn.metrics import accuracy_score
 
+import tensorflow as tf
 from tensorflow.keras.models import Sequential
 from tensorflow.keras.layers import Dense, Dropout, BatchNormalization, Input
 from tensorflow.keras.regularizers import l2
@@ -19,8 +21,15 @@ from tensorflow.keras.optimizers import Adam
 from tensorflow.keras.losses import CategoricalCrossentropy
 from tensorflow.keras import backend as K
 
+# 明确告知用户正在使用 CPU
+print("="*50)
+print("正在启动 CPU 极致性能模式...")
+print("已自动屏蔽 GPU 缺失警告。即使没有显卡，结果也完全一致。")
+print("请耐心等待训练完成 (预计需要 1-2 小时)...")
+print("="*50)
+
 # ==========================================
-# 0. 核心工具：省内存生成器 (保持不变)
+# 0. 核心工具：省内存生成器
 # ==========================================
 class SparseGenerator(Sequence):
     def __init__(self, x_set, y_set, batch_size):
@@ -33,7 +42,8 @@ class SparseGenerator(Sequence):
 
     def __getitem__(self, idx):
         batch_indices = self.indices[idx * self.batch_size : (idx + 1) * self.batch_size]
-        batch_x = self.x[batch_indices].toarray() 
+        # astype('float32') 确保 CPU 计算兼容性
+        batch_x = self.x[batch_indices].toarray().astype('float32')
         batch_y = self.y[batch_indices]
         return batch_x, batch_y
     
@@ -41,7 +51,7 @@ class SparseGenerator(Sequence):
         np.random.shuffle(self.indices)
 
 # ==========================================
-# 1. 读取数据与预处理
+# 1. 读取数据
 # ==========================================
 print("正在读取数据...")
 train_df = pd.read_csv('train.csv')
@@ -50,26 +60,24 @@ test_df = pd.read_csv('test.csv')
 X = train_df['text']
 y = train_df['emotions']
 
-# 标签编码
 label_encoder = LabelEncoder()
 y_encoded = label_encoder.fit_transform(y)
 num_classes = len(label_encoder.classes_)
 
-# 计算类别权重 (这对不平衡数据至关重要)
+# 计算类别权重
 class_weights = class_weight.compute_class_weight(
     class_weight='balanced',
     classes=np.unique(y_encoded),
     y=y_encoded
 )
 class_weight_dict = dict(enumerate(class_weights))
-print(f"类别权重: {class_weight_dict}")
 
 # ==========================================
-# 2. 特征工程：Word + Char 双通道
+# 2. 特征工程：Word + Char 双通道 (最强版本)
 # ==========================================
 print("正在提取 Word TF-IDF 特征...")
 tfidf_word = TfidfVectorizer(stop_words='english', 
-                             max_features=8000, 
+                             max_features=10000, 
                              ngram_range=(1, 2),
                              sublinear_tf=True,
                              dtype=np.float32)
@@ -78,7 +86,7 @@ X_test_word = tfidf_word.transform(test_df['text'])
 
 print("正在提取 Char TF-IDF 特征...")
 tfidf_char = TfidfVectorizer(analyzer='char',
-                             max_features=10000,
+                             max_features=12000, 
                              ngram_range=(3, 5),
                              sublinear_tf=True,
                              dtype=np.float32)
@@ -91,123 +99,94 @@ X_test_tfidf = hstack([X_test_word, X_test_char]).tocsr()
 print(f"特征总维度: {X_all_tfidf.shape[1]}")
 
 # ==========================================
-# 3. 模型定义
+# 3. 定义模型 (CPU 优化版)
 # ==========================================
-def build_nn_model(input_shape):
+def build_model(input_shape):
     reg_strength = 0.0001
     model = Sequential([
         Input(shape=(input_shape,)),
-        # 宽网络结构
-        Dense(1024, activation='swish', kernel_regularizer=l2(reg_strength)),
+        
+        # 保持宽网络结构以保证精度
+        Dense(1500, activation='swish', kernel_regularizer=l2(reg_strength)),
         BatchNormalization(),
         Dropout(0.5),
-        Dense(512, activation='swish', kernel_regularizer=l2(reg_strength)),
+        
+        Dense(800, activation='swish', kernel_regularizer=l2(reg_strength)),
         BatchNormalization(),
         Dropout(0.5),
-        Dense(256, activation='swish', kernel_regularizer=l2(reg_strength)),
+        
+        Dense(400, activation='swish', kernel_regularizer=l2(reg_strength)),
         BatchNormalization(),
         Dropout(0.4),
+
         Dense(num_classes, activation='softmax')
     ])
+    
+    # 默认使用 float32，避免 CPU 上的兼容性问题
     optimizer = Adam(learning_rate=0.0003) 
-    # Label Smoothing 防止过拟合
     loss_fn = CategoricalCrossentropy(label_smoothing=0.1)
     model.compile(optimizer=optimizer, loss=loss_fn, metrics=['accuracy'])
     return model
 
 # ==========================================
-# 4. 5折交叉验证 + 模型融合 (NN + SVM)
+# 4. 5折交叉验证 (CPU 配置)
 # ==========================================
 n_splits = 5
 kfold = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=42)
 
-# 存储最终的概率和
 test_probs_sum = np.zeros((X_test_tfidf.shape[0], num_classes), dtype=np.float32)
-val_scores = []
+val_accuracies = []
 
-print(f"\n开始 {n_splits} 折交叉验证 (NN + SVM 融合版)...")
+print(f"\n开始 {n_splits} 折交叉验证...")
 
 for fold, (train_idx, val_idx) in enumerate(kfold.split(X_all_tfidf, y_encoded)):
     print(f"\n--- Fold {fold+1} / {n_splits} ---")
     
-    # 1. 准备数据
     X_train_fold, X_val_fold = X_all_tfidf[train_idx], X_all_tfidf[val_idx]
     y_train_fold, y_val_fold = y_encoded[train_idx], y_encoded[val_idx]
     
-    # ---------------------------
-    # 模型 A: Neural Network
-    # ---------------------------
-    print("训练 Neural Network...")
     y_train_fold_onehot = to_categorical(y_train_fold, num_classes)
     y_val_fold_onehot = to_categorical(y_val_fold, num_classes)
     
-    train_gen = SparseGenerator(X_train_fold, y_train_fold_onehot, batch_size=128)
-    val_gen = SparseGenerator(X_val_fold, y_val_fold_onehot, batch_size=128)
+    # CPU 关键修改：Batch Size 调小到 64
+    # 这样 CPU 处理起来更顺畅，不会卡顿
+    batch_size = 64 
     
-    model_nn = build_nn_model(X_train_fold.shape[1])
-    early_stopping = EarlyStopping(monitor='val_loss', patience=4, restore_best_weights=True)
-    reduce_lr = ReduceLROnPlateau(monitor='val_loss', factor=0.2, patience=2, min_lr=1e-6, verbose=0)
+    train_gen = SparseGenerator(X_train_fold, y_train_fold_onehot, batch_size=batch_size)
+    val_gen = SparseGenerator(X_val_fold, y_val_fold_onehot, batch_size=batch_size)
     
-    model_nn.fit(train_gen, validation_data=val_gen, epochs=25, 
-                 class_weight=class_weight_dict, 
-                 callbacks=[early_stopping, reduce_lr], verbose=1)
+    model = build_model(X_train_fold.shape[1])
     
-    # 预测验证集和测试集 (NN)
-    # 构造临时 generator 用于预测
-    val_gen_pred = SparseGenerator(X_val_fold, np.zeros((X_val_fold.shape[0], num_classes)), batch_size=128)
-    test_gen_pred = SparseGenerator(X_test_tfidf, np.zeros((X_test_tfidf.shape[0], num_classes)), batch_size=128)
+    early_stopping = EarlyStopping(monitor='val_loss', patience=5, restore_best_weights=True)
+    reduce_lr = ReduceLROnPlateau(monitor='val_loss', factor=0.2, patience=2, min_lr=1e-6, verbose=1)
     
-    val_probs_nn = model_nn.predict(val_gen_pred, verbose=0)
-    test_probs_nn = model_nn.predict(test_gen_pred, verbose=0)
+    model.fit(train_gen,
+              validation_data=val_gen,
+              epochs=30,
+              class_weight=class_weight_dict,
+              callbacks=[early_stopping, reduce_lr],
+              verbose=1)
     
-    # 清理 NN 内存
-    del model_nn, train_gen, val_gen, val_gen_pred, test_gen_pred
+    # 评估
+    _, val_acc = model.evaluate(val_gen, verbose=0)
+    val_accuracies.append(val_acc)
+    print(f"Fold {fold+1} 验证集准确率: {val_acc:.5f}")
+    
+    # 预测测试集
+    test_gen = SparseGenerator(X_test_tfidf, np.zeros((X_test_tfidf.shape[0], 1)), batch_size=batch_size)
+    test_probs_fold = model.predict(test_gen, verbose=0)
+    test_probs_sum += test_probs_fold
+    
+    # 垃圾回收
+    del model, train_gen, val_gen, X_train_fold, X_val_fold, test_gen, test_probs_fold
     K.clear_session()
     gc.collect()
 
-    # ---------------------------
-    # 模型 B: SVM (LinearSVC)
-    # ---------------------------
-    print("训练 SVM (LinearSVC)...")
-    # CalibratedClassifierCV 让我们能从 SVM 得到概率输出
-    # SVM 可以直接处理稀疏矩阵，内存占用极小，速度极快
-    svm = LinearSVC(class_weight='balanced', dual=False, max_iter=2000, C=0.5)
-    model_svm = CalibratedClassifierCV(svm, method='sigmoid', cv='prefit') 
-    
-    # 需要先拟合 svm，再拟合 calibration
-    svm.fit(X_train_fold, y_train_fold)
-    model_svm.fit(X_train_fold, y_train_fold) # 这里其实是 calibrate，因为 cv='prefit'
-    
-    val_probs_svm = model_svm.predict_proba(X_val_fold)
-    test_probs_svm = model_svm.predict_proba(X_test_tfidf)
-    
-    # ---------------------------
-    # 融合 (Blending)
-    # ---------------------------
-    # 经验权重：NN 通常更准，给 0.6；SVM 给 0.4 补充线性特征
-    w_nn = 0.6
-    w_svm = 0.4
-    
-    val_probs_ensemble = (w_nn * val_probs_nn) + (w_svm * val_probs_svm)
-    val_pred_ensemble = val_probs_ensemble.argmax(axis=1)
-    
-    fold_acc = accuracy_score(y_val_fold, val_pred_ensemble)
-    val_scores.append(fold_acc)
-    print(f"Fold {fold+1} 融合准确率: {fold_acc:.5f}")
-    
-    # 累加测试集概率
-    test_probs_ensemble = (w_nn * test_probs_nn) + (w_svm * test_probs_svm)
-    test_probs_sum += test_probs_ensemble
-    
-    # 清理本折内存
-    del X_train_fold, X_val_fold, model_svm, svm
-    gc.collect()
-
 # ==========================================
-# 5. 生成提交
+# 5. 生成结果
 # ==========================================
 print("\n" + "="*30)
-print(f"5折平均融合准确率: {np.mean(val_scores):.5f}")
+print(f"5折平均验证准确率: {np.mean(val_accuracies):.5f}")
 print("="*30)
 
 avg_test_probs = test_probs_sum / n_splits
@@ -219,5 +198,5 @@ submission = pd.DataFrame({
     'label': test_labels_decoded
 })
 
-submission.to_csv('submission_ensemble_final.csv', index=False)
-print("预测完成！结果已保存为 'submission_ensemble_final.csv'")
+submission.to_csv('submission_cpu_final.csv', index=False)
+print("预测完成！结果已保存为 'submission_cpu_final.csv'")

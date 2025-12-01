@@ -1,3 +1,7 @@
+import os
+# 1. 允许显示 GPU 日志
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2' 
+
 import pandas as pd
 import numpy as np
 import gc
@@ -16,37 +20,25 @@ from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau
 from tensorflow.keras.optimizers import Adam
 from tensorflow.keras.losses import CategoricalCrossentropy
 from tensorflow.keras import backend as K
-from tensorflow.keras import mixed_precision # 引入混合精度
 
 # ==========================================
-# 0. GPU 专属配置 (关键修改)
+# GPU 显存设置 (关键步骤)
 # ==========================================
-print("正在配置 GPU...")
-
-# 1. 显存按需分配 (防止一启动就爆显存)
 gpus = tf.config.list_physical_devices('GPU')
 if gpus:
     try:
         for gpu in gpus:
+            # 开启显存按需分配，防止一启动就占满显存导致 OOM
             tf.config.experimental.set_memory_growth(gpu, True)
-        print(f"检测到 {len(gpus)} 个 GPU，已开启显存按需分配。")
+        print(f"=== 成功检测到 GPU: {len(gpus)} 个 ===")
+        print("已开启显存按需分配模式")
     except RuntimeError as e:
         print(e)
 else:
-    print("未检测到 GPU，将使用 CPU 运行。")
-
-# 2. 开启混合精度 (Mixed Precision)
-# 这会让 GPU 计算速度大幅提升，且节省显存
-try:
-    if gpus:
-        policy = mixed_precision.Policy('mixed_float16')
-        mixed_precision.set_global_policy(policy)
-        print("已开启 Mixed Precision (float16) 加速。")
-except Exception as e:
-    print("无法开启混合精度，将保持默认 float32。")
+    print("!!! 未检测到 GPU，将使用 CPU 运行 !!!")
 
 # ==========================================
-# 1. 核心工具：省内存生成器
+# 0. 数据生成器
 # ==========================================
 class SparseGenerator(Sequence):
     def __init__(self, x_set, y_set, batch_size):
@@ -59,7 +51,8 @@ class SparseGenerator(Sequence):
 
     def __getitem__(self, idx):
         batch_indices = self.indices[idx * self.batch_size : (idx + 1) * self.batch_size]
-        batch_x = self.x[batch_indices].toarray() 
+        # GPU 计算通常也使用 float32，保持不变
+        batch_x = self.x[batch_indices].toarray().astype('float32')
         batch_y = self.y[batch_indices]
         return batch_x, batch_y
     
@@ -67,9 +60,14 @@ class SparseGenerator(Sequence):
         np.random.shuffle(self.indices)
 
 # ==========================================
-# 2. 读取数据
+# 1. 读取数据
 # ==========================================
 print("正在读取数据...")
+# 请确保当前目录下有这些文件
+if not os.path.exists('train.csv'):
+    print("错误：未找到 train.csv，请检查路径")
+    exit()
+
 train_df = pd.read_csv('train.csv')
 test_df = pd.read_csv('test.csv')
 
@@ -89,12 +87,11 @@ class_weights = class_weight.compute_class_weight(
 class_weight_dict = dict(enumerate(class_weights))
 
 # ==========================================
-# 3. 特征工程：Word + Char 双通道 (回归最强版本)
+# 2. 特征工程
 # ==========================================
 print("正在提取 Word TF-IDF 特征...")
-# 稍微增加特征量，因为 GPU 混合精度可以省内存
 tfidf_word = TfidfVectorizer(stop_words='english', 
-                             max_features=10000, # 提升到 10000
+                             max_features=10000, 
                              ngram_range=(1, 2),
                              sublinear_tf=True,
                              dtype=np.float32)
@@ -103,7 +100,7 @@ X_test_word = tfidf_word.transform(test_df['text'])
 
 print("正在提取 Char TF-IDF 特征...")
 tfidf_char = TfidfVectorizer(analyzer='char',
-                             max_features=12000, # 提升到 12000
+                             max_features=12000, 
                              ngram_range=(3, 5),
                              sublinear_tf=True,
                              dtype=np.float32)
@@ -116,30 +113,26 @@ X_test_tfidf = hstack([X_test_word, X_test_char]).tocsr()
 print(f"特征总维度: {X_all_tfidf.shape[1]}")
 
 # ==========================================
-# 4. 定义 GPU 优化模型
+# 3. 定义模型
 # ==========================================
 def build_model(input_shape):
     reg_strength = 0.0001
     model = Sequential([
         Input(shape=(input_shape,)),
         
-        # 第一层：更宽
         Dense(1500, activation='swish', kernel_regularizer=l2(reg_strength)),
         BatchNormalization(),
         Dropout(0.5),
         
-        # 第二层
         Dense(800, activation='swish', kernel_regularizer=l2(reg_strength)),
         BatchNormalization(),
         Dropout(0.5),
         
-        # 第三层
         Dense(400, activation='swish', kernel_regularizer=l2(reg_strength)),
         BatchNormalization(),
         Dropout(0.4),
 
-        # 输出层：注意混合精度下，Softmax 必须保持 float32 才能保证数值稳定
-        Dense(num_classes, activation='softmax', dtype='float32') 
+        Dense(num_classes, activation='softmax')
     ])
     
     optimizer = Adam(learning_rate=0.0003) 
@@ -148,16 +141,15 @@ def build_model(input_shape):
     return model
 
 # ==========================================
-# 5. 5折交叉验证
+# 4. 5折交叉验证 (GPU 优化版)
 # ==========================================
 n_splits = 5
 kfold = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=42)
 
-# 使用 float32 存储结果
 test_probs_sum = np.zeros((X_test_tfidf.shape[0], num_classes), dtype=np.float32)
 val_accuracies = []
 
-print(f"\n开始 {n_splits} 折交叉验证 (GPU 混合精度版)...")
+print(f"\n开始 {n_splits} 折交叉验证 (GPU Mode)...")
 
 for fold, (train_idx, val_idx) in enumerate(kfold.split(X_all_tfidf, y_encoded)):
     print(f"\n--- Fold {fold+1} / {n_splits} ---")
@@ -168,8 +160,9 @@ for fold, (train_idx, val_idx) in enumerate(kfold.split(X_all_tfidf, y_encoded))
     y_train_fold_onehot = to_categorical(y_train_fold, num_classes)
     y_val_fold_onehot = to_categorical(y_val_fold, num_classes)
     
-    # 稍微增大 Batch Size (GPU 混合精度允许更大 Batch)
-    batch_size = 256 
+    # GPU 关键修改：Batch Size 调大
+    # CPU 跑 64 合适，GPU 跑 512-1024 效率更高 (取决于显存大小，这里设为 512 比较稳妥)
+    batch_size = 1024
     
     train_gen = SparseGenerator(X_train_fold, y_train_fold_onehot, batch_size=batch_size)
     val_gen = SparseGenerator(X_val_fold, y_val_fold_onehot, batch_size=batch_size)
@@ -202,7 +195,7 @@ for fold, (train_idx, val_idx) in enumerate(kfold.split(X_all_tfidf, y_encoded))
     gc.collect()
 
 # ==========================================
-# 6. 生成结果
+# 5. 生成结果
 # ==========================================
 print("\n" + "="*30)
 print(f"5折平均验证准确率: {np.mean(val_accuracies):.5f}")
@@ -217,5 +210,5 @@ submission = pd.DataFrame({
     'label': test_labels_decoded
 })
 
-submission.to_csv('submission_gpu_optimized.csv', index=False)
-print("预测完成！结果已保存为 'submission_gpu_optimized.csv'")
+submission.to_csv('submission_gpu_final.csv', index=False)
+print("预测完成！结果已保存为 'submission_gpu_final.csv'")
